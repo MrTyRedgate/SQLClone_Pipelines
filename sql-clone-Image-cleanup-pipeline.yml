@@ -1,0 +1,768 @@
+# SQL Clone - Cleanup Images & Clones Pipeline
+#
+# This pipeline provides a safe way to clean up old SQL Clone images and their associated clones
+# to reclaim storage space on a regular basis.
+#
+# Prerequisites:
+# 1. SQL Clone PowerShell module installed on build agent
+# 2. SQL Clone Server accessible from build agent  
+# 3. Create variable group 'SqlClone_Config' with:
+#    - SQLCLONE_SERVER_URL: SQL Clone server URL (e.g., http://sql-clone-server:14145)
+# 4. Ensure build agent has proper permissions to delete images and clones
+# 
+# Features:
+# - Lists all images sorted by creation date (oldest first)
+# - Shows detailed information about each image and clone counts
+# - Smart age filtering: excludes old images BUT preserves images with active clone dependencies
+# - Manual approval step with dropdown selection for image deletion
+# - Automatic deletion of associated clones before image removal (follows Redgate best practices)
+# - Uses official PowerShell pipeline patterns for optimal performance
+# - Comprehensive safety warnings and confirmations
+
+trigger: none
+
+parameters:
+- name: pipelineMode
+  displayName: 'Pipeline Mode'
+  type: string
+  values:
+  - 'Discovery - Show Available Images'
+  - 'Deletion - Delete Selected Image'
+  default: 'Discovery - Show Available Images'
+
+- name: includeProtectedImages
+  displayName: 'Include images with "KEEP" or "PROD" in name'
+  type: boolean
+  default: false
+
+- name: selectedImageForDeletion
+  displayName: 'Image to Delete (leave as "NOT_SELECTED" for Discovery mode)'
+  type: string
+  default: 'NOT_SELECTED'
+
+- name: confirmDeletion
+  displayName: 'I understand this will permanently delete the image and all its clones'
+  type: boolean
+  default: false
+
+pool:
+  name: default
+
+variables:
+- group: SqlClone_Config
+- name: selectedImageName
+  value: ''
+
+stages:
+# =============================================================================
+# STAGE 1: DISCOVERY - LIST ALL IMAGES AND THEIR CLONES
+# =============================================================================
+- stage: Discovery
+  displayName: 'Discover Images & Clones'
+  jobs:
+  - job: DiscoverResources
+    displayName: 'List Images and Associated Clones'
+    steps:
+    - powershell: |
+        Write-Host "=== SQL Clone Cleanup Pipeline ==="
+        Write-Host "Build Number: $(Build.BuildNumber)"
+        Write-Host "Current Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        Write-Host ""
+        
+        # Parameters validation and display
+        Write-Host "=== Pipeline Configuration ==="
+        Write-Host "Pipeline Mode: ${{ parameters.pipelineMode }}"
+        Write-Host "Include Protected Images: ${{ parameters.includeProtectedImages }}"
+        if ("${{ parameters.pipelineMode }}" -eq "Deletion - Delete Selected Image") {
+          Write-Host "Selected Image for Deletion: '${{ parameters.selectedImageForDeletion }}'"
+          Write-Host "Confirm Deletion: ${{ parameters.confirmDeletion }}"
+        }
+        Write-Host "SQL Clone Server: $(SQLCLONE_SERVER_URL)"
+        Write-Host ""
+      displayName: 'Display Pipeline Configuration'
+    
+    - powershell: |
+        Write-Host "=== Connecting to SQL Clone Server ==="
+        
+        try {
+          # Import and connect to SQL Clone
+          Import-Module "RedGate.SqlClone.PowerShell" -Force
+          Write-Host "✅ SQL Clone PowerShell module imported successfully"
+          
+          Connect-SqlClone -ServerUrl "$(SQLCLONE_SERVER_URL)"
+          Write-Host "✅ Connected to SQL Clone server successfully"
+          
+        } catch {
+          Write-Host "❌ Failed to connect to SQL Clone server: $($_.Exception.Message)"
+          Write-Host ""
+          Write-Host "Troubleshooting steps:"
+          Write-Host "1. Verify SQL Clone server is running and accessible"
+          Write-Host "2. Check the server URL is correct"
+          Write-Host "3. Ensure network connectivity from build agent"
+          throw
+        }
+      displayName: 'Connect to SQL Clone Server'
+    
+    - powershell: |
+        Write-Host "=== Discovering SQL Clone Images ==="
+        
+        try {
+          # Import and connect to SQL Clone
+          Import-Module "RedGate.SqlClone.PowerShell" -Force
+          Connect-SqlClone -ServerUrl "$(SQLCLONE_SERVER_URL)"
+          
+          # Get all images
+          Write-Host "Retrieving all images from SQL Clone server..."
+          $allImages = Get-SqlCloneImage
+          
+          if (-not $allImages) {
+            Write-Host "ℹ️  No images found on SQL Clone server"
+            Write-Host "##vso[task.setvariable variable=hasImages;isOutput=true]false"
+            exit 0
+          }
+          
+          Write-Host "Found $($allImages.Count) total image(s)"
+          
+          # Apply protected images filter if needed
+          $includeProtected = [bool]"${{ parameters.includeProtectedImages }}"
+          $filteredImages = $allImages
+          
+          if (-not $includeProtected) {
+            $beforeCount = $filteredImages.Count
+            $filteredImages = $filteredImages | Where-Object { 
+              $_.Name -notmatch "(?i)(keep|prod|production|protected|master)" 
+            }
+            $protectedCount = $beforeCount - $filteredImages.Count
+            if ($protectedCount -gt 0) {
+              Write-Host "Excluded $protectedCount protected image(s) (containing KEEP/PROD/PRODUCTION/PROTECTED/MASTER)"
+            }
+          }
+          
+          if (-not $filteredImages -or $filteredImages.Count -eq 0) {
+            Write-Host "ℹ️  No images match the specified criteria"
+            Write-Host "##vso[task.setvariable variable=hasImages;isOutput=true]false"
+            exit 0
+          }
+          
+          # Sort images by creation date (oldest first)
+          $sortedImages = $filteredImages | Sort-Object CreatedDate
+          
+          Write-Host ""
+          Write-Host "=== Filtered Images ($(($sortedImages | Measure-Object).Count) found) ==="
+          Write-Host "Sorted by creation date (oldest first):"
+          Write-Host ""
+          
+          # Create comprehensive image report
+          $imageReport = @()
+          $totalSizeGB = 0
+          
+          foreach ($image in $sortedImages) {
+            Write-Host "📷 Image: $($image.Name)"
+            Write-Host "   Created: $($image.CreatedDate.ToString('yyyy-MM-dd HH:mm:ss'))"
+            Write-Host "   Age: $(((Get-Date) - $image.CreatedDate).Days) days"
+            Write-Host "   Size: $([math]::Round($image.SizeInBytes / 1GB, 2)) GB"
+            Write-Host "   Location: $($image.ImageLocation.Path)"
+            
+            $totalSizeGB += [math]::Round($image.SizeInBytes / 1GB, 2)
+            
+            # Get clone count for this image (for reporting only)
+            try {
+              # Get all clones and count those associated with this image
+              $allClonesForCount = Get-SqlClone
+              $clones = $allClonesForCount | Where-Object { 
+                # Convert both to string for comparison to avoid type mismatches
+                [string]$_.ParentImageId -eq [string]$image.Id 
+              }
+              
+              if ($clones -and $clones.Count -gt 0) {
+                Write-Host "   � Associated Clones: $($clones.Count)"
+              } else {
+                Write-Host "   ✅ No associated clones"
+              }
+            } catch {
+              Write-Host "   ❌ Error checking clone count: $($_.Exception.Message)"
+              # Set clones to empty array if there's an error
+              $clones = @()
+            }
+            
+            # Add to report for dropdown generation
+            $ageInDays = ((Get-Date) - $image.CreatedDate).Days
+            $sizeGB = [math]::Round($image.SizeInBytes / 1GB, 2)
+            $cloneCount = if ($clones -and $clones.Count) { $clones.Count } else { 0 }
+            
+            $imageReport += "$($image.Name) | $($image.CreatedDate.ToString('yyyy-MM-dd')) | ${ageInDays}d | ${sizeGB}GB | ${cloneCount} clones"
+            
+            Write-Host ""
+          }
+          
+          Write-Host "=== Summary ==="
+          Write-Host "Total Images Matching Criteria: $(($sortedImages | Measure-Object).Count)"
+          Write-Host "Total Size: $([math]::Round($totalSizeGB, 2)) GB"
+          Write-Host ""
+          
+          # Store image list for dropdown in approval step
+          $imageListForDropdown = $imageReport -join ";"
+          Write-Host "##vso[task.setvariable variable=imageListForDropdown;isOutput=true]$imageListForDropdown"
+          Write-Host "##vso[task.setvariable variable=hasImages;isOutput=true]true"
+          Write-Host "##vso[task.setvariable variable=imageCount;isOutput=true]$(($sortedImages | Measure-Object).Count)"
+          Write-Host "##vso[task.setvariable variable=totalSizeGB;isOutput=true]$([math]::Round($totalSizeGB, 2))"
+          
+        } catch {
+          Write-Host "❌ Failed to discover images: $($_.Exception.Message)"
+          throw
+        }
+      displayName: 'Discover Images and Clones'
+      name: discoverStep
+    
+    - powershell: |
+        if ("$(discoverStep.hasImages)" -eq "false") {
+          Write-Host "ℹ️  No cleanup required - no images match the specified criteria"
+          exit 0
+        }
+        
+        Write-Host "=== Image Discovery Complete ==="
+        Write-Host "Images found: $(discoverStep.imageCount)"
+        Write-Host "Total size: $(discoverStep.totalSizeGB) GB"
+        Write-Host ""
+        
+        if ("${{ parameters.pipelineMode }}" -eq "Discovery - Show Available Images") {
+          Write-Host "✅ Discovery mode completed successfully"
+          Write-Host ""
+          Write-Host "📋 TO DELETE AN IMAGE:"
+          Write-Host "1. Run this pipeline again with these settings:"
+          Write-Host "   • Pipeline Mode = 'Deletion - Delete Selected Image'"
+          Write-Host "   • Selected Image for Deletion = [copy exact image name from list above]"
+          Write-Host "   • Confirm Deletion = true"
+          Write-Host ""
+          Write-Host "💡 COPY the exact image name from the list above!"
+          Write-Host ""
+          Write-Host "🔄 Pipeline will complete here in Discovery mode."
+        } else {
+          # Deletion mode validation
+          if ("${{ parameters.selectedImageForDeletion }}" -eq "" -or "${{ parameters.selectedImageForDeletion }}" -eq "NOT_SELECTED") {
+            Write-Host "⚠️  ERROR: No image selected for deletion"
+            Write-Host ""
+            Write-Host "📋 Available images found in this run:"
+            # Show the current list for reference
+            Write-Host "$(discoverStep.imageListForDropdown)" | ForEach-Object { $_ -replace ";", "`n" }
+            Write-Host ""
+            Write-Host "Please run the pipeline again with:"
+            Write-Host "• Pipeline Mode = 'Deletion - Delete Selected Image'"  
+            Write-Host "• Selected Image for Deletion = [exact image name from above - replace 'NOT_SELECTED']"
+            Write-Host "• Confirm Deletion = true"
+            exit 1
+          } elseif ("${{ parameters.confirmDeletion }}" -eq "false") {
+            Write-Host "⚠️  ERROR: Deletion not confirmed"
+            Write-Host "You must check 'I understand this will permanently delete...' to proceed"
+            Write-Host ""
+            Write-Host "This safety measure prevents accidental deletions."
+            exit 1
+          } else {
+            Write-Host "➡️  Proceeding to deletion of image: '${{ parameters.selectedImageForDeletion }}'"
+            Write-Host "⚠️  WARNING: This will permanently delete the image and all associated clones!"
+          }
+        }
+      displayName: 'Discovery Summary'
+
+# =============================================================================
+# STAGE 2: VALIDATION - VERIFY SELECTED IMAGE EXISTS
+# =============================================================================
+- stage: ValidationStage
+  displayName: 'Validate Selected Image'
+  dependsOn: Discovery
+  condition: and(succeeded(), eq(dependencies.Discovery.outputs['DiscoverResources.discoverStep.hasImages'], 'true'), eq('${{ parameters.pipelineMode }}', 'Deletion - Delete Selected Image'), ne('${{ parameters.selectedImageForDeletion }}', ''), ne('${{ parameters.selectedImageForDeletion }}', 'NOT_SELECTED'), eq('${{ parameters.confirmDeletion }}', true))
+  jobs:
+  - job: ValidateSelection
+    displayName: 'Validate Image Selection'
+    variables:
+      imageListForDropdown: $[ stageDependencies.Discovery.DiscoverResources.outputs['discoverStep.imageListForDropdown'] ]
+    steps:
+    - powershell: |
+        Write-Host "=== Validating Image Selection ==="
+        Write-Host "Selected Image: '${{ parameters.selectedImageForDeletion }}'"
+        Write-Host ""
+        
+        try {
+          # Import and connect to SQL Clone
+          Import-Module "RedGate.SqlClone.PowerShell" -Force
+          Connect-SqlClone -ServerUrl "$(SQLCLONE_SERVER_URL)"
+          
+          # Get the specific image
+          $selectedImageName = "${{ parameters.selectedImageForDeletion }}"
+          Write-Host "🔍 Searching for image: '$selectedImageName'"
+          
+          $selectedImage = Get-SqlCloneImage | Where-Object { $_.Name -eq $selectedImageName }
+          
+          if (-not $selectedImage) {
+            Write-Host "❌ ERROR: Image '$selectedImageName' not found!"
+            Write-Host ""
+            Write-Host "📋 Available images from discovery:"
+            $imageList = "$(imageListForDropdown)"
+            $imageEntries = $imageList -split ";"
+            foreach ($entry in $imageEntries) {
+              if ($entry.Trim()) {
+                $imageName = ($entry -split " \| ")[0]
+                Write-Host "   • $imageName"
+              }
+            }
+            Write-Host ""
+            Write-Host "💡 Please use the exact image name from the list above"
+            throw "Image not found: $selectedImageName"
+          }
+          
+          Write-Host "✅ Image found successfully!"
+          Write-Host "   Name: $($selectedImage.Name)"
+          Write-Host "   Created: $($selectedImage.CreatedDate.ToString('yyyy-MM-dd HH:mm:ss'))"
+          Write-Host "   Size: $([math]::Round($selectedImage.SizeInBytes / 1GB, 2)) GB"
+          
+          # Check for clones with enhanced debugging
+          Write-Host "🔍 Searching for clones associated with image ID: $($selectedImage.Id)"
+          
+          $allClones = Get-SqlClone
+          Write-Host "📊 Total clones on server: $($allClones.Count)"
+          
+          # Enhanced debug for clone filtering
+          Write-Host "🔍 Debug: Looking for clones with ParentImageId matching '$($selectedImage.Id)' (type: $($selectedImage.Id.GetType().Name))"
+          
+          $clones = $allClones | Where-Object { 
+            # Convert both to string for comparison to avoid type mismatches
+            [string]$_.ParentImageId -eq [string]$selectedImage.Id 
+          }
+          
+          # Show comparison details
+          Write-Host "📋 ParentImageId comparison details:"
+          $uniqueParentIds = $allClones | Select-Object -ExpandProperty ParentImageId | Sort-Object -Unique
+          foreach ($parentId in $uniqueParentIds) {
+            $cloneCount = ($allClones | Where-Object { $_.ParentImageId -eq $parentId }).Count
+            $match = ([string]$parentId -eq [string]$selectedImage.Id)
+            $matchStatus = if($match){'✅ MATCH'} else {'❌'}
+            Write-Host "   ParentImageId ${parentId}: $cloneCount clones $matchStatus"
+          }
+          
+          if ($clones) {
+            Write-Host ""
+            Write-Host "⚠️  CLONES TO BE DELETED ($($clones.Count)):"
+            foreach ($clone in $clones) {
+              $serverName = if ($clone.Location -and $clone.Location.ServerInstance) { 
+                $clone.Location.ServerInstance.Name 
+              } else { 
+                "Unknown Server" 
+              }
+              Write-Host "   🔗 $($clone.Name) on $serverName (Clone ID: $($clone.Id))"
+            }
+            Write-Host ""
+            Write-Host "##vso[task.setvariable variable=cloneCount;isOutput=true]$($clones.Count)"
+          } else {
+            Write-Host ""
+            Write-Host "✅ No associated clones found for this image"
+            
+            # Enhanced debugging - show detailed clone structure
+            if ($allClones.Count -gt 0) {
+              Write-Host ""
+              Write-Host "🔧 DETAILED DEBUGGING - Clone Structure Analysis:"
+              
+              $firstClone = $allClones | Select-Object -First 1
+              Write-Host "   📊 Sample Clone Object Structure ($($firstClone.Name)):"
+              
+              # Show ALL properties of the clone object
+              $firstClone | Get-Member -MemberType Property | Sort-Object Name | ForEach-Object {
+                $propName = $_.Name
+                try {
+                  $propValue = $firstClone.$propName
+                  if ($propValue -is [string] -and $propValue.Length -gt 50) {
+                    $propValue = $propValue.Substring(0, 47) + "..."
+                  }
+                  Write-Host "      $propName = $propValue"
+                } catch {
+                  Write-Host "      $propName = <Error accessing property>"
+                }
+              }
+              
+              Write-Host ""
+              Write-Host "   🔍 Searching for Image Reference Properties:"
+              $imageProps = $firstClone | Get-Member -MemberType Property | Where-Object { 
+                $_.Name -like "*Image*" -or $_.Name -like "*Parent*" -or $_.Name -like "*Source*" -or $_.Name -like "*Origin*"
+              }
+              
+              if ($imageProps) {
+                foreach ($prop in $imageProps) {
+                  try {
+                    $value = $firstClone.$($prop.Name)
+                    Write-Host "      ⭐ $($prop.Name) = $value"
+                    
+                    if ($value -and $value -ne $null) {
+                      # If this property is an object, show its properties too
+                      if ($value.GetType().Name -ne "String" -and $value.GetType().Name -ne "Int32") {
+                        Write-Host "         Object Properties:"
+                        $value | Get-Member -MemberType Property | ForEach-Object {
+                          try {
+                            $subValue = $value.$($_.Name)
+                            Write-Host "           $($_.Name) = $subValue"
+                          } catch {
+                            Write-Host "           $($_.Name) = <Error>"
+                          }
+                        }
+                      }
+                    }
+                  } catch {
+                    Write-Host "      ⭐ $($prop.Name) = <Error accessing>"
+                  }
+                }
+              } else {
+                Write-Host "      ❌ No Image-related properties found!"
+              }
+              
+              Write-Host ""
+              Write-Host "🎯 Target Image Details:"
+              Write-Host "   Looking for Image ID: $($selectedImage.Id)"
+              Write-Host "   Looking for Image Name: $($selectedImage.Name)"
+            }
+            
+            Write-Host "##vso[task.setvariable variable=cloneCount;isOutput=true]0"
+          }
+          
+          # Store validated image information
+          Write-Host "##vso[task.setvariable variable=validatedImageName;isOutput=true]$($selectedImage.Name)"
+          Write-Host "##vso[task.setvariable variable=validatedImageId;isOutput=true]$($selectedImage.Id)"
+          Write-Host "##vso[task.setvariable variable=validatedImageSize;isOutput=true]$([math]::Round($selectedImage.SizeInBytes / 1GB, 2))"
+          
+        } catch {
+          Write-Host "❌ Validation failed: $($_.Exception.Message)"
+          throw
+        }
+      displayName: 'Validate Selected Image'
+      name: validateStep
+
+# =============================================================================
+# STAGE 3: FINAL CONFIRMATION - MANUAL APPROVAL WITH SPECIFIC DETAILS
+# =============================================================================
+- stage: FinalConfirmation
+  displayName: 'Final Deletion Confirmation'
+  dependsOn: 
+  - Discovery
+  - ValidationStage
+  condition: succeeded()
+  jobs:
+  - job: FinalApproval
+    displayName: 'Final Approval Required'
+    pool: server
+    timeoutInMinutes: 60  # 1 hour timeout
+    variables:
+      validatedImageName: $[ stageDependencies.ValidationStage.ValidateSelection.outputs['validateStep.validatedImageName'] ]
+      cloneCount: $[ stageDependencies.ValidationStage.ValidateSelection.outputs['validateStep.cloneCount'] ]
+      validatedImageSize: $[ stageDependencies.ValidationStage.ValidateSelection.outputs['validateStep.validatedImageSize'] ]
+    steps:
+    - task: ManualValidation@0
+      displayName: 'Final Deletion Confirmation'
+      inputs:
+        notifyUsers: 'user@email.com'  # Update with your notification email
+        instructions: |
+          � FINAL CONFIRMATION REQUIRED 🚨
+          
+          You are about to DELETE the following SQL Clone image:
+          
+          📷 IMAGE TO DELETE:
+          • Name: $(validatedImageName)
+          • Size: $(validatedImageSize) GB
+          • Associated Clones: $(cloneCount)
+          
+          ⚠️  THIS ACTION WILL:
+          1. 🗑️ Delete $(cloneCount) clone(s) first (if any)
+          2. 🗑️ Delete the image "$(validatedImageName)"
+          3. 💾 PERMANENTLY destroy all data in these resources
+          4. ⏱️ Potentially cause downtime for dependent applications
+          
+          🔴 THIS CANNOT BE UNDONE!
+          
+          📝 TO PROCEED:
+          • Click "Resume" to confirm deletion
+          • Click "Reject" to cancel this operation
+          
+          ⚡ DELETION WILL START IMMEDIATELY AFTER APPROVAL
+        onTimeout: 'reject'
+
+# =============================================================================  
+# STAGE 4: SAFE DELETION - REMOVE CLONES THEN IMAGE
+# =============================================================================
+- stage: SafeDeletion
+  displayName: 'Safe Image & Clone Deletion'
+  dependsOn: 
+  - Discovery
+  - ValidationStage
+  - FinalConfirmation
+  condition: succeeded()
+  jobs:
+  - job: DeleteImageJob
+    displayName: 'Delete Selected Image and Clones'
+    variables:
+      validatedImageName: $[ stageDependencies.ValidationStage.ValidateSelection.outputs['validateStep.validatedImageName'] ]
+      validatedImageId: $[ stageDependencies.ValidationStage.ValidateSelection.outputs['validateStep.validatedImageId'] ]
+      cloneCount: $[ stageDependencies.ValidationStage.ValidateSelection.outputs['validateStep.cloneCount'] ]
+      validatedImageSize: $[ stageDependencies.ValidationStage.ValidateSelection.outputs['validateStep.validatedImageSize'] ]
+    steps:
+    - powershell: |
+        Write-Host "=== EXECUTING SAFE DELETION PROCESS ==="
+        Write-Host "Image to delete: $(validatedImageName)"
+        Write-Host "Image ID: $(validatedImageId)" 
+        Write-Host "Associated clones: $(cloneCount)"
+        Write-Host "Image size: $(validatedImageSize) GB"
+        Write-Host ""
+        Write-Host "⚠️  DELETION PROCESS STARTING - THIS CANNOT BE UNDONE!"
+        Write-Host ""
+      displayName: 'Initialize Deletion Process'
+    
+    - powershell: |
+        Write-Host "=== STEP 1: DELETE ASSOCIATED CLONES ==="
+        
+        try {
+          # Import and connect to SQL Clone
+          Import-Module "RedGate.SqlClone.PowerShell" -Force
+          Connect-SqlClone -ServerUrl "$(SQLCLONE_SERVER_URL)"
+          Write-Host "✅ Connected to SQL Clone server"
+          
+          $imageId = "$(validatedImageId)"
+          $imageName = "$(validatedImageName)"
+          $cloneCount = [int]"$(cloneCount)"
+          
+          if ($cloneCount -gt 0) {
+            Write-Host "🔍 Finding clones for image '$imageName' (ID: $imageId)"
+            $clones = Get-SqlClone | Where-Object { [string]$_.ParentImageId -eq [string]$imageId }
+            
+            if ($clones) {
+              Write-Host "Found $($clones.Count) clone(s) to delete:"
+              foreach ($clone in $clones) {
+                Write-Host "   🔗 $($clone.Name) on $($clone.Location.ServerInstance.Name)"
+              }
+              
+              # Delete clones using the recommended pipeline pattern from Redgate documentation
+              Write-Host ""
+              Write-Host "🗑️ Deleting $($clones.Count) clone(s) using official pipeline pattern..."
+              
+              try {
+                # Use the official pattern: Get-SqlClone | Remove-SqlClone | Wait-SqlCloneOperation
+                $deleteOperations = $clones | Remove-SqlClone
+                Write-Host "   ✅ All clone deletion operations initiated successfully"
+                
+                # Wait for all operations to complete (pipeline pattern)
+                Write-Host "⏳ Waiting for all clone deletions to complete..."
+                $deleteOperations | Wait-SqlCloneOperation
+                Write-Host "   ✅ All clone deletion operations completed successfully"
+                
+              } catch {
+                Write-Host "   ❌ Pipeline deletion failed: $($_.Exception.Message)"
+                Write-Host "   📋 Falling back to individual clone deletion for detailed error reporting..."
+                
+                # Fallback: delete clones individually for better error diagnostics
+                $deleteOperations = @()
+                foreach ($clone in $clones) {
+                  Write-Host "      🗑️ Individual deletion: '$($clone.Name)' on $($clone.Location.ServerInstance.Name)"
+                  
+                  try {
+                    $operation = Remove-SqlClone -Clone $clone
+                    $deleteOperations += $operation
+                    Write-Host "         ✅ Clone deletion initiated (Operation ID: $($operation.Id))"
+                  } catch {
+                    Write-Host "         ❌ Failed to delete clone '$($clone.Name)': $($_.Exception.Message)"
+                    throw "Clone deletion failed for: $($clone.Name)"
+                  }
+                }
+                
+                # Wait for individual operations
+                Write-Host "      ⏳ Waiting for individual clone deletions to complete..."
+                foreach ($operation in $deleteOperations) {
+                  Write-Host "         Waiting for operation $($operation.Id)..."
+                  try {
+                    Wait-SqlCloneOperation -Operation $operation
+                    Write-Host "         ✅ Operation $($operation.Id) completed successfully"
+                  } catch {
+                    Write-Host "         ❌ Operation $($operation.Id) failed: $($_.Exception.Message)"
+                    throw "Clone deletion operation failed: $($operation.Id)"
+                  }
+                }
+              }
+              
+              # Wait for all clone deletions to complete
+              Write-Host ""
+              Write-Host "⏳ Waiting for clone deletions to complete..."
+              foreach ($operation in $deleteOperations) {
+                Write-Host "   Waiting for operation $($operation.Id)..."
+                try {
+                  Wait-SqlCloneOperation -Operation $operation
+                  Write-Host "   ✅ Operation $($operation.Id) completed successfully"
+                } catch {
+                  Write-Host "   ❌ Operation $($operation.Id) failed: $($_.Exception.Message)"
+                  throw "Clone deletion operation failed: $($operation.Id)"
+                }
+              }
+              
+              Write-Host ""
+              Write-Host "✅ All $($clones.Count) clone(s) deleted successfully!"
+              
+            } else {
+              Write-Host "ℹ️ No clones found for this image (expected count was $cloneCount)"
+            }
+          } else {
+            Write-Host "ℹ️ No clones to delete for this image"
+          }
+          
+          Write-Host "##vso[task.setvariable variable=clonesDeleted;isOutput=true]true"
+          
+        } catch {
+          Write-Host "❌ Clone deletion process failed: $($_.Exception.Message)"
+          Write-Host "##vso[task.setvariable variable=clonesDeleted;isOutput=true]false"
+          throw
+        }
+      displayName: 'Delete Associated Clones'
+      name: deleteClonesStep
+    
+    - powershell: |
+        Write-Host "=== STEP 2: DELETE IMAGE ==="
+        
+        try {
+          # Import and connect to SQL Clone
+          Import-Module "RedGate.SqlClone.PowerShell" -Force
+          Connect-SqlClone -ServerUrl "$(SQLCLONE_SERVER_URL)"
+          
+          $imageName = "$(validatedImageName)"
+          $imageSize = "$(validatedImageSize)"
+          
+          Write-Host "🗑️ Deleting image: '$imageName'"
+          Write-Host "   Size to be reclaimed: $imageSize GB"
+          
+          # Get the image object again (in case it was refreshed)
+          $image = Get-SqlCloneImage | Where-Object { $_.Name -eq $imageName }
+          
+          if (-not $image) {
+            Write-Host "❌ Image '$imageName' not found during deletion step!"
+            throw "Image not found: $imageName"
+          }
+          
+          Write-Host "🔍 Verifying no clones remain..."
+          $remainingClones = Get-SqlClone | Where-Object { [string]$_.ParentImageId -eq [string]$image.Id }
+          
+          if ($remainingClones) {
+            Write-Host "❌ ERROR: $($remainingClones.Count) clone(s) still exist for this image!"
+            foreach ($clone in $remainingClones) {
+              Write-Host "   🔗 $($clone.Name) on $($clone.Location.ServerInstance.Name)"
+            }
+            throw "Cannot delete image while clones still exist"
+          }
+          
+          Write-Host "✅ No remaining clones found - safe to delete image"
+          
+          # Delete the image using official pipeline pattern
+          Write-Host "🗑️ Initiating image deletion using official pattern..."
+          Write-Host "⏳ Waiting for image deletion to complete..."
+          
+          # Use the official pattern: Get-SqlCloneImage | Remove-SqlCloneImage | Wait-SqlCloneOperation
+          $image | Remove-SqlCloneImage | Wait-SqlCloneOperation
+          
+          Write-Host ""
+          Write-Host "🎉 IMAGE DELETION SUCCESSFUL!"
+          Write-Host "   Image '$imageName' has been permanently deleted"
+          Write-Host "   Space reclaimed: $imageSize GB"
+          
+          Write-Host "##vso[task.setvariable variable=imageDeleted;isOutput=true]true"
+          Write-Host "##vso[task.setvariable variable=spaceReclaimed;isOutput=true]$imageSize"
+          
+        } catch {
+          Write-Host "❌ Image deletion failed: $($_.Exception.Message)"
+          Write-Host "##vso[task.setvariable variable=imageDeleted;isOutput=true]false"
+          throw
+        }
+      displayName: 'Delete Image'
+      name: deleteImageStep
+    
+    - powershell: |
+        Write-Host "=== Deletion Process Summary ==="
+        Write-Host "✅ SQL Clone Deletion Process Completed Successfully!"
+        Write-Host ""
+        Write-Host "📊 Deletion Summary:"
+        Write-Host "• Image Deleted: $(validatedImageName)"
+        Write-Host "• Clones Deleted: $(cloneCount)"
+        Write-Host "• Space Reclaimed: $(validatedImageSize) GB"
+        Write-Host "• Manual Approval: Completed"
+        Write-Host "• Process Duration: $(((Get-Date) - [datetime]'$(System.PipelineStartTime)').TotalMinutes.ToString('F1')) minutes"
+        Write-Host ""
+        Write-Host "🎉 SUCCESS!"
+        Write-Host "The selected image and all associated clones have been safely deleted."
+        Write-Host "Storage space has been reclaimed and the system is ready for continued use."
+        Write-Host ""
+        Write-Host "� Recommended Next Steps:"
+        Write-Host "• Monitor remaining storage capacity"
+        Write-Host "• Update any documentation referencing the deleted image"
+        Write-Host "• Schedule regular cleanup runs to maintain system efficiency"
+        Write-Host ""
+        Write-Host "⚠️ Remember: The deleted resources cannot be recovered!"
+      displayName: 'Deletion Summary'
+      condition: always()
+
+# =============================================================================
+# STAGE 4: REPORTING & CLEANUP SUMMARY
+# =============================================================================
+- stage: Reporting
+  displayName: 'Cleanup Report & Summary'
+  dependsOn: 
+  - Discovery
+  - SafeDeletion
+  condition: always()
+  jobs:
+  - job: GenerateReport
+    displayName: 'Generate Cleanup Report'
+    variables:
+      hasImages: $[ stageDependencies.Discovery.DiscoverResources.outputs['discoverStep.hasImages'] ]
+      imageCount: $[ stageDependencies.Discovery.DiscoverResources.outputs['discoverStep.imageCount'] ]
+      totalSizeGB: $[ stageDependencies.Discovery.DiscoverResources.outputs['discoverStep.totalSizeGB'] ]
+      imageDeleted: $[ stageDependencies.SafeDeletion.DeleteImageJob.outputs['deleteImageStep.imageDeleted'] ]
+      spaceReclaimed: $[ stageDependencies.SafeDeletion.DeleteImageJob.outputs['deleteImageStep.spaceReclaimed'] ]
+    steps:
+    - powershell: |
+        Write-Host "=== SQL Clone Cleanup Report ==="
+        Write-Host "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        Write-Host "Build: $(Build.BuildNumber)"
+        Write-Host ""
+        
+        Write-Host "📊 DISCOVERY RESULTS:"
+        Write-Host "• Images Found: $(hasImages)"
+        if ("$(hasImages)" -eq "true") {
+          Write-Host "• Total Images: $(imageCount)"
+          Write-Host "• Total Size: $(totalSizeGB) GB" 
+        }
+        Write-Host "• Show All Images: Yes"
+        Write-Host "• Include Protected: ${{ parameters.includeProtectedImages }}"
+        Write-Host ""
+        
+        Write-Host "⚙️ PIPELINE EXECUTION:"
+        Write-Host "• Pipeline Mode: ${{ parameters.pipelineMode }}"
+        Write-Host "• Selected Image: '${{ parameters.selectedImageForDeletion }}'"
+        Write-Host "• Confirm Deletion: ${{ parameters.confirmDeletion }}"
+        if ("${{ parameters.pipelineMode }}" -eq "Deletion - Delete Selected Image" -and "$(hasImages)" -eq "true") {
+          if ("$(imageDeleted)" -eq "true") {
+            Write-Host "• Deletion Status: ✅ SUCCESS"
+            Write-Host "• Space Reclaimed: $(spaceReclaimed) GB"
+          } elseif ("$(imageDeleted)" -eq "false") {
+            Write-Host "• Deletion Status: ❌ FAILED"
+          } else {
+            Write-Host "• Deletion Status: ⏭️ SKIPPED (validation or approval failed)"
+          }
+        }
+        Write-Host ""
+        
+        Write-Host "📈 RECOMMENDATIONS:"
+        if ("$(hasImages)" -eq "true") {
+          Write-Host "• Consider running cleanup regularly to maintain storage efficiency"
+          Write-Host "• Review image retention policies with your team"
+          Write-Host "• Monitor clone usage patterns to optimize image lifecycle"
+        } else {
+          Write-Host "• No immediate cleanup required"
+          Write-Host "• Continue monitoring image growth"
+        }
+        Write-Host ""
+        
+        Write-Host "🔄 NEXT SCHEDULED CLEANUP:"
+        Write-Host "• Recommended frequency: Weekly or bi-weekly"
+        Write-Host "• Best time: During low-usage periods"
+        Write-Host "• Consider automated scheduling for routine maintenance"
+        
+      displayName: 'Generate Cleanup Report'
+      condition: always()

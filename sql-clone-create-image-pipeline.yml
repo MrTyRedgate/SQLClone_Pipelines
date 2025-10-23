@@ -1,0 +1,492 @@
+# SQL Clone - Create Image from Backup Pipeline
+#
+# This pipeline creates a SQL Clone image from a backup file using PowerShell cmdlets
+# 
+# Prerequisites:
+# 1. SQL Clone PowerShell module installed on build agent
+# 2. SQL Clone Server accessible from build agent  
+# 3. Create variable group 'SqlClone_Config' with:
+#    - SQLCLONE_SERVER_URL: SQL Clone server URL (e.g., http://sql-clone-server:14145)
+#    - SQLCLONE_SQL_SERVER_MACHINE: Machine name hosting SQL Server
+#    - SQLCLONE_SQL_SERVER_INSTANCE: SQL Server instance name
+#    - SQLCLONE_IMAGE_LOCATION_PATH: UNC path where images are stored
+# 4. Ensure build agent has access to backup files and image storage location
+
+trigger: none
+
+# Ready for PR triggers - uncomment and modify as needed
+# pr:
+#   branches:
+#     include:
+#     - release
+#     - main
+
+parameters:
+- name: imageName
+  displayName: 'SQL Clone Image Name (leave as "AUTO" for auto-generated)'
+  type: string
+  default: 'AUTO'
+
+- name: backupFilePath
+  displayName: 'Backup File Path (UNC or local path) - REQUIRED'
+  type: string
+  default: 'REQUIRED - Enter backup file path here'
+
+- name: backupPassword
+  displayName: 'Backup Password (leave as "NONE" if not encrypted)'
+  type: string
+  default: 'NONE'
+
+- name: sqlServerMachine
+  displayName: 'SQL Server Machine Name (leave as "DEFAULT" to use config)'
+  type: string
+  default: 'DEFAULT'
+
+- name: sqlServerInstance
+  displayName: 'SQL Server Instance Name (leave as "DEFAULT" to use config)'
+  type: string
+  default: 'DEFAULT'
+
+- name: imageLocationPath
+  displayName: 'Image Storage Location (leave as "DEFAULT" to use config)'
+  type: string
+  default: 'DEFAULT'
+
+- name: enableImageCompaction
+  displayName: 'Enable Image Compaction'
+  type: boolean
+  default: false
+
+- name: waitForCompletion
+  displayName: 'Wait for Image Creation Completion'
+  type: boolean
+  default: true
+
+pool:
+  name: default
+
+variables:
+- group: SqlClone_Config
+
+stages:
+# =============================================================================
+# STAGE 1: VALIDATE INPUTS AND PREREQUISITES
+# =============================================================================
+- stage: Validate
+  displayName: 'Validate Inputs & Prerequisites'
+  jobs:
+  - job: ValidateInputs
+    displayName: 'Validate Pipeline Inputs'
+    steps:
+    - powershell: |
+        Write-Host "=== SQL Clone Image Creation Pipeline ==="
+        Write-Host "Build Number: $(Build.BuildNumber)"
+        Write-Host ""
+        
+        # Process parameters and set final values
+        $imageName = "${{ parameters.imageName }}".Trim()
+        $sqlServerMachine = "${{ parameters.sqlServerMachine }}".Trim()
+        $sqlServerInstance = "${{ parameters.sqlServerInstance }}".Trim()
+        $imageLocationPath = "${{ parameters.imageLocationPath }}".Trim()
+        
+        # Set final values with defaults
+        if ($imageName -eq "AUTO") {
+          $imageNameFinal = "AutoImage-$(Build.BuildNumber)"
+        } else {
+          $imageNameFinal = $imageName
+        }
+        
+        if ($sqlServerMachine -eq "DEFAULT") {
+          $sqlServerMachineFinal = "$(SQLCLONE_SQL_SERVER_MACHINE)"
+        } else {
+          $sqlServerMachineFinal = $sqlServerMachine
+        }
+        
+        if ($sqlServerInstance -eq "DEFAULT") {
+          $sqlServerInstanceFinal = "$(SQLCLONE_SQL_SERVER_INSTANCE)"
+        } else {
+          $sqlServerInstanceFinal = $sqlServerInstance
+        }
+        
+        if ($imageLocationPath -eq "DEFAULT") {
+          $imageLocationFinal = "$(SQLCLONE_IMAGE_LOCATION_PATH)"
+        } else {
+          $imageLocationFinal = $imageLocationPath
+        }
+        
+        # Store processed values in pipeline variables
+        Write-Host "##vso[task.setvariable variable=imageNameFinal;isOutput=true]$imageNameFinal"
+        Write-Host "##vso[task.setvariable variable=sqlServerMachineFinal;isOutput=true]$sqlServerMachineFinal"
+        Write-Host "##vso[task.setvariable variable=sqlServerInstanceFinal;isOutput=true]$sqlServerInstanceFinal"
+        Write-Host "##vso[task.setvariable variable=imageLocationFinal;isOutput=true]$imageLocationFinal"
+        
+        # Validate required parameters
+        $errors = @()
+        
+        $backupPath = "${{ parameters.backupFilePath }}".Trim()
+        if ($backupPath -eq "REQUIRED - Enter backup file path here" -or -not $backupPath) {
+          $errors += "❌ Backup File Path is required - please enter a valid backup file path"
+        } else {
+          Write-Host "✅ Backup File Path: $backupPath"
+        }
+        
+        if (-not $imageNameFinal.Trim()) {
+          $errors += "❌ Image Name cannot be empty"
+        } else {
+          Write-Host "✅ Image Name: $imageNameFinal"
+        }
+        
+        Write-Host "✅ SQL Server: $sqlServerMachineFinal\$sqlServerInstanceFinal"
+        Write-Host "✅ Image Location: $imageLocationFinal"
+        Write-Host "✅ SQL Clone Server: $(SQLCLONE_SERVER_URL)"
+        
+        if ($errors.Count -gt 0) {
+          Write-Host ""
+          Write-Host "❌ Validation Errors:"
+          $errors | ForEach-Object { Write-Host "  $_" }
+          Write-Host ""
+          throw "Pipeline validation failed. Please correct the errors above."
+        }
+        
+        Write-Host ""
+        Write-Host "✅ All validations passed successfully"
+      displayName: 'Validate Required Parameters'
+      name: validateParams
+    
+    - powershell: |
+        Write-Host "=== Checking SQL Clone PowerShell Module ==="
+        
+        try {
+          $module = Get-Module -ListAvailable "RedGate.SqlClone.PowerShell"
+          if ($module) {
+            Write-Host "✅ SQL Clone PowerShell module found"
+            Write-Host "   Version: $($module.Version)"
+            Write-Host "   Path: $($module.ModuleBase)"
+          } else {
+            Write-Host "❌ SQL Clone PowerShell module not found"
+            Write-Host ""
+            Write-Host "To install the module:"
+            Write-Host "1. Download from SQL Clone Server Settings > PowerShell page"
+            Write-Host "2. Or install from PowerShell Gallery if available"
+            throw "SQL Clone PowerShell module is required but not installed"
+          }
+        } catch {
+          Write-Host "❌ Error checking SQL Clone module: $($_.Exception.Message)"
+          throw
+        }
+      displayName: 'Check SQL Clone PowerShell Module'
+
+# =============================================================================
+# STAGE 2: CREATE SQL CLONE IMAGE
+# =============================================================================
+- stage: CreateImage
+  displayName: 'Create SQL Clone Image'
+  dependsOn: Validate
+  condition: succeeded()
+  jobs:
+  - job: CreateImageJob
+    displayName: 'Create Image from Backup'
+    variables:
+      imageNameFinal: $[ stageDependencies.Validate.ValidateInputs.outputs['validateParams.imageNameFinal'] ]
+      sqlServerMachineFinal: $[ stageDependencies.Validate.ValidateInputs.outputs['validateParams.sqlServerMachineFinal'] ]
+      sqlServerInstanceFinal: $[ stageDependencies.Validate.ValidateInputs.outputs['validateParams.sqlServerInstanceFinal'] ]
+      imageLocationFinal: $[ stageDependencies.Validate.ValidateInputs.outputs['validateParams.imageLocationFinal'] ]
+    steps:
+    - powershell: |
+        Write-Host "=== Connecting to SQL Clone Server ==="
+        Write-Host "Server URL: $(SQLCLONE_SERVER_URL)"
+        
+        try {
+          # Import the SQL Clone module
+          Import-Module "RedGate.SqlClone.PowerShell" -Force
+          Write-Host "✅ SQL Clone PowerShell module imported successfully"
+          
+          # Connect to SQL Clone server
+          Connect-SqlClone -ServerUrl "$(SQLCLONE_SERVER_URL)"
+          Write-Host "✅ Connected to SQL Clone server successfully"
+          
+        } catch {
+          Write-Host "❌ Failed to connect to SQL Clone server: $($_.Exception.Message)"
+          Write-Host ""
+          Write-Host "Troubleshooting steps:"
+          Write-Host "1. Verify SQL Clone server is running and accessible"
+          Write-Host "2. Check the server URL is correct"
+          Write-Host "3. Ensure network connectivity from build agent"
+          throw
+        }
+      displayName: 'Connect to SQL Clone Server'
+    
+    - powershell: |
+        Write-Host "=== Retrieving SQL Clone Resources ==="
+        
+        try {
+          # Import and connect to SQL Clone (each PowerShell step needs its own connection)
+          Import-Module "RedGate.SqlClone.PowerShell" -Force
+          Connect-SqlClone -ServerUrl "$(SQLCLONE_SERVER_URL)"
+          Write-Host "✅ Connected to SQL Clone server"
+          
+          # Get processed values from job variables
+          $sqlServerMachineFinal = "$(sqlServerMachineFinal)"
+          $sqlServerInstanceFinal = "$(sqlServerInstanceFinal)"
+          $imageLocationFinal = "$(imageLocationFinal)"
+          
+          Write-Host "Debug - SQL Server Machine: '$sqlServerMachineFinal'"
+          Write-Host "Debug - SQL Server Instance: '$sqlServerInstanceFinal'"
+          Write-Host "Debug - Image Location: '$imageLocationFinal'"
+          
+          # Get SQL Server instance
+          Write-Host "Getting SQL Server instance: $sqlServerMachineFinal\$sqlServerInstanceFinal"
+          $sqlServerInstance = Get-SqlCloneSqlServerInstance -MachineName $sqlServerMachineFinal -InstanceName $sqlServerInstanceFinal
+          
+          if (-not $sqlServerInstance) {
+            throw "SQL Server instance not found or not registered with SQL Clone"
+          }
+          Write-Host "✅ SQL Server instance found: $($sqlServerInstance.Name)"
+          
+          # Get image location
+          Write-Host "Getting image location: $imageLocationFinal"
+          $imageLocation = Get-SqlCloneImageLocation -Path $imageLocationFinal
+          
+          if (-not $imageLocation) {
+            throw "Image location not found or not accessible"
+          }
+          Write-Host "✅ Image location found: $($imageLocation.Path)"
+          
+          # Store in pipeline variables for next step
+          Write-Host "##vso[task.setvariable variable=SqlServerInstanceId]$($sqlServerInstance.Id)"
+          Write-Host "##vso[task.setvariable variable=ImageLocationId]$($imageLocation.Id)"
+          
+        } catch {
+          Write-Host "❌ Failed to retrieve SQL Clone resources: $($_.Exception.Message)"
+          Write-Host ""
+          Write-Host "Troubleshooting steps:"
+          Write-Host "1. Verify SQL Server is registered with SQL Clone"
+          Write-Host "2. Check image location path is accessible"
+          Write-Host "3. Ensure proper permissions on image location"
+          throw
+        }
+      displayName: 'Get SQL Clone Resources'
+    
+    - powershell: |
+        Write-Host "=== Validating Backup File ==="
+        
+        $backupPath = "${{ parameters.backupFilePath }}".Trim()
+        
+        # Skip validation if user didn't change the default placeholder
+        if ($backupPath -eq "REQUIRED - Enter backup file path here") {
+          Write-Host "❌ Backup file path not provided - using placeholder value"
+          throw "Please provide a valid backup file path"
+        }
+        
+        Write-Host "Backup file path: $backupPath"
+        
+        try {
+          # Check if backup file exists
+          if (Test-Path $backupPath) {
+            $fileInfo = Get-Item $backupPath
+            Write-Host "✅ Backup file found"
+            Write-Host "   Size: $([math]::Round($fileInfo.Length / 1MB, 2)) MB"
+            Write-Host "   Last Modified: $($fileInfo.LastWriteTime)"
+            
+            # Check file extension
+            $extension = [System.IO.Path]::GetExtension($backupPath).ToLower()
+            $validExtensions = @('.bak', '.sqb', '.trn')
+            
+            if ($extension -in $validExtensions) {
+              Write-Host "✅ Valid backup file extension: $extension"
+            } else {
+              Write-Host "⚠️  Unusual backup file extension: $extension (expected .bak, .sqb, .trn)"
+            }
+            
+          } else {
+            throw "Backup file not found or not accessible: $backupPath"
+          }
+        } catch {
+          Write-Host "❌ Backup file validation failed: $($_.Exception.Message)"
+          throw
+        }
+      displayName: 'Validate Backup File'
+    
+    - powershell: |
+        Write-Host "=== Creating SQL Clone Image ==="
+        
+        # Get processed values from job variables
+        $imageNameFinal = "$(imageNameFinal)"
+        $backupPath = "${{ parameters.backupFilePath }}".Trim()
+        
+        Write-Host "Image Name: $imageNameFinal"
+        Write-Host "Backup File: $backupPath"
+        
+        try {
+          # Import and connect to SQL Clone (each PowerShell step needs its own connection)
+          Import-Module "RedGate.SqlClone.PowerShell" -Force
+          Connect-SqlClone -ServerUrl "$(SQLCLONE_SERVER_URL)"
+          Write-Host "✅ Connected to SQL Clone server"
+          
+          # Get resources again using stored IDs
+          $sqlServerInstance = Get-SqlCloneSqlServerInstance | Where-Object { $_.Id -eq "$(SqlServerInstanceId)" }
+          $imageLocation = Get-SqlCloneImageLocation | Where-Object { $_.Id -eq "$(ImageLocationId)" }
+          
+          # Prepare New-SqlCloneImage parameters
+          $imageParams = @{
+            Name = $imageNameFinal
+            SqlServerInstance = $sqlServerInstance
+            BackupFileName = @($backupPath)
+            Destination = $imageLocation
+          }
+          
+          # Add backup password if provided
+          $backupPassword = "${{ parameters.backupPassword }}".Trim()
+          if ($backupPassword -ne "NONE" -and $backupPassword) {
+            Write-Host "✅ Using backup password (encrypted backup detected)"
+            $imageParams.BackupPassword = $backupPassword
+          } else {
+            Write-Host "ℹ️  No backup password provided (unencrypted backup)"
+          }
+          
+          # Add image compaction if requested
+          if ("${{ parameters.enableImageCompaction }}" -eq "true") {
+            Write-Host "✅ Image compaction enabled"
+            $imageParams.CompactImage = "Compact"
+          }
+          
+          Write-Host ""
+          Write-Host "Starting image creation operation..."
+          
+          # Create the image
+          $imageOperation = New-SqlCloneImage @imageParams
+          
+          if (-not $imageOperation) {
+            throw "Failed to start image creation operation"
+          }
+          
+          Write-Host "✅ Image creation operation started successfully"
+          Write-Host "   Operation ID: $($imageOperation.Id)"
+          Write-Host "   Status: $($imageOperation.Status)"
+          
+          # Store operation ID for monitoring
+          Write-Host "##vso[task.setvariable variable=ImageOperationId]$($imageOperation.Id)"
+          
+        } catch {
+          Write-Host "❌ Failed to create SQL Clone image: $($_.Exception.Message)"
+          Write-Host ""
+          Write-Host "Common issues:"
+          Write-Host "1. Backup file corruption or incompatibility"
+          Write-Host "2. Insufficient disk space on image location"
+          Write-Host "3. SQL Server instance not accessible"
+          Write-Host "4. Permissions issues"
+          throw
+        }
+      displayName: 'Start Image Creation'
+    
+    - powershell: |
+        if ("${{ parameters.waitForCompletion }}" -ne "true") {
+          Write-Host "⏭️  Skipping wait for completion (waitForCompletion = false)"
+          Write-Host "Image creation operation started successfully"
+          Write-Host "Operation ID: $(ImageOperationId)"
+          Write-Host ""
+          Write-Host "To monitor progress:"
+          Write-Host "1. Check SQL Clone Server web interface"
+          Write-Host "2. Image should appear as 'AutoImage-$(Build.BuildNumber)' or your custom name"
+          exit 0
+        }
+        
+        Write-Host "=== Waiting for Image Creation Completion ==="
+        Write-Host "This may take several minutes depending on backup size..."
+        Write-Host "Operation ID: $(ImageOperationId)"
+        
+        try {
+          # Import and connect to SQL Clone (each PowerShell step needs its own connection)
+          Import-Module "RedGate.SqlClone.PowerShell" -Force
+          Connect-SqlClone -ServerUrl "$(SQLCLONE_SERVER_URL)"
+          Write-Host "✅ Connected to SQL Clone server"
+          
+          # Since we can't get operations by ID, we'll monitor by checking if the image exists and is ready
+          $imageNameFinal = "$(imageNameFinal)"
+          Write-Host "Monitoring image creation for: $imageNameFinal"
+          
+          $startTime = Get-Date
+          $maxWaitMinutes = 30  # Maximum wait time
+          $imageFound = $false
+          
+          Write-Host "Starting monitoring (timeout: $maxWaitMinutes minutes)..."
+          
+          do {
+            Start-Sleep -Seconds 15
+            
+            try {
+              # Check if image exists and get its status
+              $image = Get-SqlCloneImage -Name $imageNameFinal -ErrorAction SilentlyContinue
+              
+              if ($image) {
+                $imageFound = $true
+                Write-Host "✅ Image found: $($image.Name)"
+                Write-Host "   Status: Ready"
+                Write-Host "   Size: $([math]::Round($image.SizeInBytes / 1GB, 2)) GB"
+                Write-Host "   Created: $($image.CreatedDate)"
+                Write-Host "   Location: $($image.ImageLocation.Path)"
+                break
+              } else {
+                $elapsed = (Get-Date) - $startTime
+                Write-Host "⏱️  Still creating... | Elapsed: $($elapsed.ToString('hh\:mm\:ss'))"
+              }
+            } catch {
+              # Image might not be ready yet, continue waiting
+              $elapsed = (Get-Date) - $startTime
+              Write-Host "⏱️  Image not ready yet... | Elapsed: $($elapsed.ToString('hh\:mm\:ss'))"
+            }
+            
+            $elapsed = (Get-Date) - $startTime
+            
+          } while ($elapsed.TotalMinutes -lt $maxWaitMinutes)
+          
+          $totalTime = (Get-Date) - $startTime
+          
+          if ($imageFound) {
+            Write-Host ""
+            Write-Host "=== Image Creation Completed Successfully ==="
+            Write-Host "✅ SQL Clone image '$imageNameFinal' created successfully!"
+            Write-Host "Total Time: $($totalTime.ToString('hh\:mm\:ss'))"
+          } else {
+            Write-Host ""
+            Write-Host "=== Image Creation Timeout ==="
+            Write-Host "⚠️  Timeout reached after $maxWaitMinutes minutes"
+            Write-Host "The image creation may still be in progress."
+            Write-Host "Check the SQL Clone Server web interface for current status."
+            Write-Host "Image name: $imageNameFinal"
+            # Don't throw error as the image might still be creating successfully
+          }
+          
+        } catch {
+          Write-Host "❌ Error during image creation monitoring: $($_.Exception.Message)"
+          Write-Host "The image creation may still be in progress."
+          Write-Host "Check the SQL Clone Server web interface for current status."
+          # Don't throw error as the monitoring failed, not necessarily the image creation
+        }
+      displayName: 'Wait for Image Creation (Optional)'
+      condition: eq('${{ parameters.waitForCompletion }}', true)
+    
+    - powershell: |
+        Write-Host "=== Pipeline Summary ==="
+        Write-Host "✅ SQL Clone Image Creation Pipeline Completed"
+        Write-Host ""
+        
+        # Get processed values from job variables
+        $imageNameFinal = "$(imageNameFinal)"
+        $sqlServerMachineFinal = "$(sqlServerMachineFinal)"
+        $sqlServerInstanceFinal = "$(sqlServerInstanceFinal)"
+        $imageLocationFinal = "$(imageLocationFinal)"
+        
+        Write-Host "Details:"
+        Write-Host "  Image Name: $imageNameFinal"
+        Write-Host "  Backup Source: ${{ parameters.backupFilePath }}"
+        Write-Host "  SQL Server: $sqlServerMachineFinal\$sqlServerInstanceFinal"
+        Write-Host "  Image Location: $imageLocationFinal"
+        Write-Host "  Operation ID: $(ImageOperationId)"
+        Write-Host ""
+        Write-Host "Next Steps:"
+        Write-Host "1. Verify image in SQL Clone Server interface"
+        Write-Host "2. Create clones from this image as needed"
+        Write-Host "3. Set up automated clone provisioning if required"
+      displayName: 'Pipeline Summary'
+      condition: always()
